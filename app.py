@@ -1,98 +1,137 @@
-
-from flask import Flask, request
-import os, requests, time, hmac, hashlib, base64, json
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+import os
+import requests
+import time
+import hmac
+import hashlib
+import base64
+import json
+import math
 
 load_dotenv()
 app = Flask(__name__)
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.json
-    if not data or data.get("secret") != os.getenv("WEBHOOK_SECRET"):
-        print("[ERROR] 잘못된 웹훅 요청입니다", flush=True)
-        return {"error": "unauthorized"}, 403
+# 환경변수
+api_key = os.getenv("OKX_API_KEY")
+api_secret = os.getenv("OKX_API_SECRET")
+passphrase = os.getenv("OKX_PASSPHRASE")
+symbol = os.getenv("SYMBOL")
+side = os.getenv("POSITION_SIDE")
+percent_to_trade = float(os.getenv("TRADE_PERCENT", "0.01"))
+webhook_secret = os.getenv("WEBHOOK_SECRET")
+min_order_size = 0.01  # ETH 최소 주문 수량 (OKX 기준)
 
-    signal = data.get("signal")
-    print("[Webhook] Signal received:", signal, flush=True)
+# 서명 생성 함수
+def generate_signature(timestamp, method, path, body=""):
+    message = f"{timestamp}{method}{path}{body}"
+    mac = hmac.new(bytes(api_secret, encoding='utf8'), bytes(message, encoding='utf-8'), digestmod=hashlib.sha256)
+    return base64.b64encode(mac.digest()).decode()
 
-    if signal == "BUY":
-        place_order("buy")
-    elif signal == "TP":
-        place_order("close")
-    else:
-        print("[ERROR] Unknown signal", flush=True)
-        return {"error": "unknown signal"}, 400
-    return {"status": "success"}, 200
-
-def place_order(action):
-    api_key = os.getenv("OKX_API_KEY")
-    api_secret = os.getenv("OKX_API_SECRET")
-    passphrase = os.getenv("OKX_PASSPHRASE")
-    symbol = os.getenv("SYMBOL")
-    side = os.getenv("POSITION_SIDE")
-    percent_to_trade = float(os.getenv("TRADE_PERCENT", "0.01"))
-
-    # 현재 잔고 조회
+# 잔고 조회 함수
+def get_balance():
+    path = "/api/v5/account/balance?ccy=USDT"
+    url = f"https://www.okx.com{path}"
     timestamp = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
-    account_url = "https://www.okx.com/api/v5/account/balance?ccy=USDT"
-    pre_hash = timestamp + 'GET' + '/api/v5/account/balance?ccy=USDT'
-    signature = base64.b64encode(
-        hmac.new(api_secret.encode(), pre_hash.encode(), hashlib.sha256).digest()
-    ).decode()
+    sign = generate_signature(timestamp, "GET", path)
+
     headers = {
         'OK-ACCESS-KEY': api_key,
-        'OK-ACCESS-SIGN': signature,
+        'OK-ACCESS-SIGN': sign,
         'OK-ACCESS-TIMESTAMP': timestamp,
-        'OK-ACCESS-PASSPHRASE': passphrase
+        'OK-ACCESS-PASSPHRASE': passphrase,
+        'Content-Type': 'application/json'
     }
-    res = requests.get(account_url, headers=headers)
-    print("[잔고 조회 응답]:", res.status_code, res.text, flush=True)
-    data = res.json()
 
+    response = requests.get(url, headers=headers)
+    print("[잔고 조회 응답]:", response.status_code, response.text, flush=True)
+    data = response.json()
+
+    if "data" not in data:
+        raise ValueError("잔고 조회 실패: data 없음")
+
+    return float(data["data"][0]["details"][0]["cashBal"])
+
+# 주문 실행 함수
+def place_order(action):
     try:
-        usdt_balance = float(data["data"][0]["details"][0]["cashBal"])
+        usdt_balance = get_balance()
     except Exception as e:
-        print("[ERROR] 잔고 파싱 실패:", e)
+        print("[오류] 잔고 조회 실패:", str(e))
         return
 
-    # 주문 수량 계산
-    price_res = requests.get(f"https://www.okx.com/api/v5/market/ticker?instId={symbol}")
-    last_price = float(price_res.json()["data"][0]["last"])
-    usdt_to_use = round(usdt_balance * percent_to_trade, 4)
-    order_amount = round(usdt_to_use / last_price, 6)
+    # 진입금액 (소수점 버림)
+    usdt_to_use = math.floor(usdt_balance * percent_to_trade)
+    if usdt_to_use < 1:
+        print("⚠️ 진입 자금이 1 USDT 미만이므로 최소값 1 USDT로 조정됨")
+        usdt_to_use = 1
 
-    if order_amount < 0.001:
-        print("⚠️ 주문 수량이 너무 적음. 강제로 0.001로 주문", flush=True)
-        order_amount = 0.001
-    elif order_amount % 0.001 != 0:
-        order_amount = round(order_amount - (order_amount % 0.001), 3)
+    # 현재가 조회
+    ticker_url = f"https://www.okx.com/api/v5/market/ticker?instId={symbol}"
+    last_price = float(requests.get(ticker_url).json()["data"][0]["last"])
 
-    print(f"[Info] 잔고: {usdt_balance:.2f} USDT", flush=True)
-    print(f"[Info] 진입금액: {usdt_to_use} USDT, 주문수량: {order_amount}", flush=True)
+    # 수량 계산 후, 최소 주문 수량 이상으로 반올림
+    raw_qty = usdt_to_use / last_price
+    order_qty = math.floor(raw_qty / min_order_size) * min_order_size
 
-    url_path = "/api/v5/trade/order"
-    full_url = "https://www.okx.com" + url_path
-    timestamp = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
-    body = {
+    if order_qty < min_order_size:
+        print("⚠️ 주문 수량이 너무 적음. 강제로 최소 수량으로 주문")
+        order_qty = min_order_size
+
+    order_qty = f"{order_qty:.3f}"
+
+    order_body = {
         "instId": symbol,
         "tdMode": "cross",
         "side": "buy" if action == "buy" else "sell",
         "ordType": "market",
         "posSide": side,
-        "sz": str(order_amount)
+        "sz": order_qty
     }
-    msg = timestamp + "POST" + url_path + json.dumps(body, separators=(',', ':'))
-    sign = base64.b64encode(hmac.new(api_secret.encode(), msg.encode(), hashlib.sha256).digest()).decode()
-    headers.update({
-        'Content-Type': 'application/json',
+
+    timestamp = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+    body_str = json.dumps(order_body, separators=(',', ':'))
+    sign = generate_signature(timestamp, "POST", "/api/v5/trade/order", body_str)
+
+    headers = {
+        'OK-ACCESS-KEY': api_key,
         'OK-ACCESS-SIGN': sign,
         'OK-ACCESS-TIMESTAMP': timestamp,
-    })
+        'OK-ACCESS-PASSPHRASE': passphrase,
+        'Content-Type': 'application/json'
+    }
 
-    print("[Info] 주문 바디:", json.dumps(body), flush=True)
-    res = requests.post(full_url, headers=headers, data=json.dumps(body))
+    print(f"[Info] 잔고: {usdt_balance:.2f} USDT", flush=True)
+    print(f"[Info] 진입금액: {usdt_to_use} USDT, 주문수량: {order_qty}", flush=True)
+    print("[Info] 주문 바디:", json.dumps(order_body), flush=True)
+    print("[Debug] Timestamp:", timestamp, flush=True)
+    print("[Debug] Prehash:", f"{timestamp}POST/api/v5/trade/order{body_str}", flush=True)
+    print("[Debug] Signature:", sign, flush=True)
+
+    res = requests.post("https://www.okx.com/api/v5/trade/order", headers=headers, data=body_str)
     print("[OKX 응답]", res.status_code, res.text, flush=True)
+
+# 웹훅 라우트
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json()
+
+    if not data or data.get("secret") != webhook_secret:
+        print("❌ Webhook secret mismatch or missing!")
+        return jsonify({"error": "unauthorized"}), 403
+
+    signal = data.get("signal")
+    print("[Webhook] Signal received:", signal)
+
+    if signal == "BUY":
+        place_order("buy")
+    elif signal == "TP":
+        place_order("sell")
+    else:
+        print("❌ Unknown signal:", signal)
+        return jsonify({"error": "unknown signal"}), 400
+
+    return jsonify({"status": "ok"}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
